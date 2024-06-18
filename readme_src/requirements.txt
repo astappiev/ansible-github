@@ -1,3 +1,0 @@
-ansible-core  # for ansible-doc command
-Jinja2
-pytablewriter

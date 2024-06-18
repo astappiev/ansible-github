@@ -21,7 +21,7 @@ from collections import defaultdict
 
 
 DOCUMENTATION = """
-module: install_from_github
+module: install_release
 short_description: Download and install assets from Github releases page.
 description:
   - This module can be used to select a release from a Github repository,
@@ -41,6 +41,13 @@ options:
       - The tag to select from releases page.
         The default (`latest`) means the most recent non-prerelease, non-draft release.
     default: latest
+    type: str
+
+  state:
+    description:
+      - The expected state of the package.
+        The default (`present`) means the package will not be updated automatically. If you need to update it, set to `latest`.
+    default: present
     type: str
 
   asset_regex:
@@ -105,7 +112,7 @@ RETURN = ""
 
 EXAMPLES = """
 - name: install latest version of lego (ACME client)
-  quera.github.install_from_github:
+  astappiev.github.install_release:
     repo: go-acme/lego
     asset_regex: lego.*\.tar\.gz
     version_command: lego --version
@@ -115,7 +122,7 @@ EXAMPLES = """
         mode: 0755
 
 - name: install a specific version of sentry-cli
-  quera.github.install_from_github:
+  astappiev.github.install_release:
     repo: getsentry/sentry-cli
     tag: "2.8.1"
     asset_regex: sentry-cli-.*
@@ -126,7 +133,7 @@ EXAMPLES = """
         mode: 0755
 
 - name: install both executable and data
-  quera.github.install_from_github:
+  astappiev.github.install_release:
     repo: example/example
     asset_regex: example-.*\.zip
     asset_arch_mapping:
@@ -141,7 +148,7 @@ EXAMPLES = """
         mode: 0644
 
 - name: install some data file (e.g. font, ...)
-  quera.github.install_from_github:
+  astappiev.github.install_release:
     repo: example/example
     asset_regex: exampledata.dat
     version_file: /usr/local/share/example/exampledata.dat.version
@@ -167,39 +174,44 @@ def extract_version(s: str, version_regex: str) -> Union[str, None]:
         return m.group(0)
 
 
-def is_download_required(
+def get_version_installed(
     module: AnsibleModule,
     version_command: str,
+    version_regex: str,
+    version_file: str,
+):
+    if version_file:
+        if not os.path.exists(version_file):
+            return None
+        with open(version_file, "r") as fp:
+            return fp.read().strip()
+    if not version_command:
+        return None
+
+    try:
+        rc, result_stdout, _ = module.run_command(version_command, handle_exceptions=False)
+    except (OSError, IOError):
+        return None
+    else:
+        version_installed = extract_version(result_stdout.strip(), version_regex)
+        if not version_installed:
+            module.fail_json(msg='The output of "version_command" did not contain a version.',)
+        return version_installed
+
+
+def get_version_to_install(
+    module: AnsibleModule,
     version_regex: str,
     version_file: str,
     release_info: dict,
 ):
     if version_file:
-        if not os.path.exists(version_file):
-            return True
-        with open(version_file, "r") as fp:
-            version_file_content = fp.read().strip()
-        return version_file_content != release_info["tag_name"]
-    if not version_command:
-        return True
-    try:
-        rc, result_stdout, _ = module.run_command(
-            version_command, handle_exceptions=False
-        )
-    except (OSError, IOError):
-        return True
+        return release_info["tag_name"]
     else:
-        version_installed = extract_version(result_stdout.strip(), version_regex)
-        if not version_installed:
-            module.fail_json(
-                msg='The output of "version_command" did not contain a version.',
-            )
         version_to_install = extract_version(release_info["tag_name"], version_regex)
         if not version_to_install:
-            module.fail_json(
-                msg="The tag name of Github release does not contain a version.",
-            )
-        return version_installed != version_to_install
+            module.fail_json(msg="The tag name of Github release does not contain a version.",)
+        return version_to_install
 
 
 def decompress_file(path: str):
@@ -299,9 +311,7 @@ def download_asset(module: AnsibleModule, file_name: str, url: str, move_rules: 
                 if already_included:
                     continue
                 for move_rule in move_rules:
-                    if re.fullmatch(
-                        move_rule["src_regex"], os.path.relpath(abs_path, extract_dir)
-                    ):
+                    if re.fullmatch(move_rule["src_regex"], os.path.relpath(abs_path, extract_dir)):
                         paths_to_move[move_rule["dst"]].append(abs_path)
                         paths_to_move_rule[abs_path] = move_rule
                         break
@@ -315,7 +325,25 @@ def download_asset(module: AnsibleModule, file_name: str, url: str, move_rules: 
                 move_rule.get("group"),
             )
 
+        if len(move_rules) != len(paths_to_move):
+            module.fail_json(msg='Some or all of the move rules were not found in downloaded assets.')
         return move_paths(module, paths_to_move)
+
+
+def is_target_exists(module: AnsibleModule, move_rules: dict):
+    for move_rule in move_rules:
+        filename_regex = move_rule["src_regex"].split('\/')[-1]
+        if not is_exists_in_dir(move_rule["dst"], filename_regex):
+            return False
+    return True
+
+
+def is_exists_in_dir(dir: str, regex: str):
+    for _, dirs, files in os.walk(dir):
+        for item in dirs + files:
+            if re.fullmatch(regex, item):
+                return True
+    return False
 
 
 def select_asset(
@@ -338,8 +366,8 @@ def select_asset(
     # try filtering assets based on architecture
     machine = platform.machine().lower()
     architectures = {
-        "x86_64": ["x86_64", "amd64"],
-        "amd64": ["x86_64", "amd64"],
+        "x86_64": ["x86_64", "amd64", "64"],
+        "amd64": ["x86_64", "amd64", "64"],
         "aarch64": ["aarch64", "arm64"],
         "arm64": ["aarch64", "arm64"],
     }.get(machine, [machine])
@@ -374,6 +402,7 @@ def main():
             # 2. select release
             #   if tag is not provided, we get the latest release (the most recent non-prerelease, non-draft release)
             "tag": {"required": False, "type": "str", "default": "latest"},
+            "state": {"required": False, "type": "str", "default": "present"}, # can be either `present` or `latest` similarly to Ansible's `package` module
             # 3. select asset
             "asset_regex": {"required": True, "type": "str"},
             "asset_arch_mapping": {"required": False, "type": "dict"},
@@ -384,7 +413,7 @@ def main():
             # 5. after download, move files/dirs to destinations
             "move_rules": {"required": True, "type": "list", "elements": "dict"},
         },
-        supports_check_mode=False,
+        supports_check_mode=True,
         mutually_exclusive=(
             ("version_file", "version_command"),
             ("version_file", "version_regex"),
@@ -394,6 +423,7 @@ def main():
 
     repo: str = module.params["repo"]
     tag: str = module.params["tag"]
+    state: str = module.params["state"]
     asset_regex = re.compile(module.params["asset_regex"])
     asset_arch_mapping: dict = module.params["asset_arch_mapping"]
     version_command: str = module.params["version_command"]
@@ -411,20 +441,20 @@ def main():
         "owner": {"allowed_types": [str], "required": False},
         "group": {"allowed_types": [str], "required": False},
     }
+
     for move_rule in move_rules:
         for k, schema in move_rule_schema.items():
             if schema.get("required") and k not in move_rule:
-                module.fail_json(
-                    msg=f"Some move rule does not have required argument '{k}'."
-                )
+                module.fail_json(msg=f"Some move rule does not have required argument '{k}'.")
             if k in move_rules and not any(
                 isinstance(move_rule[k], allowed_type)
                 for allowed_type in schema.get("allowed_types", [object])
             ):
-                module.fail_json(
-                    msg=f"Some move rule has invalid type for argument '{k}'."
-                )
+                module.fail_json(msg=f"Some move rule has invalid type for argument '{k}'.")
         move_rule["dst"] = os.path.expanduser(move_rule["dst"])
+
+    if state == "present" and is_target_exists(module, move_rules):
+        module.exit_json(changed=False, prepared="target present")
 
     if tag == "latest":
         # https://docs.github.com/en/rest/releases/releases#get-the-latest-release
@@ -435,24 +465,28 @@ def main():
 
     release_info = get_json_url(f"https://api.github.com{release_info_url}")
 
-    if not is_download_required(
-        module, version_command, version_regex, version_file, release_info
-    ):
-        module.exit_json(changed=False)
+    version_installed = get_version_installed(module, version_command, version_regex, version_file)
+    version_to_install = get_version_to_install(module, version_regex, version_file, release_info)
+    if version_installed != None and version_installed == version_to_install:
+        module.exit_json(changed=False, msg="version match")
 
-    asset = select_asset(
-        module, release_info["assets"], asset_regex, asset_arch_mapping
+    version_diff=dict(
+        before=str(version_installed) + '\n',
+        after=str(version_to_install) + '\n'
     )
 
-    changed = download_asset(
-        module, asset["name"], asset["browser_download_url"], move_rules
-    )
+    if module.check_mode:
+        module.exit_json(changed=True, diff=version_diff)
+
+    asset = select_asset(module, release_info["assets"], asset_regex, asset_arch_mapping)
+
+    changed = download_asset(module, asset["name"], asset["browser_download_url"], move_rules)
 
     if version_file:
         with open(version_file, "w") as fp:
             fp.write(release_info["tag_name"])
 
-    module.exit_json(changed=changed)
+    module.exit_json(changed=changed, diff=version_diff)
 
 
 if __name__ == "__main__":
