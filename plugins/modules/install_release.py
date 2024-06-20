@@ -298,6 +298,7 @@ def download_asset(module: AnsibleModule, file_name: str, url: str, move_rules: 
         except shutil.ReadError:
             shutil.move(file_path, extract_dir)
 
+        regex_found = {}
         paths_to_move = defaultdict(list)
         paths_to_move_rule = {}
 
@@ -313,6 +314,7 @@ def download_asset(module: AnsibleModule, file_name: str, url: str, move_rules: 
                     continue
                 for move_rule in move_rules:
                     if re.fullmatch(move_rule["src_regex"], os.path.relpath(abs_path, extract_dir)):
+                        regex_found[move_rule["src_regex"]] = 1
                         paths_to_move[move_rule["dst"]].append(abs_path)
                         paths_to_move_rule[abs_path] = move_rule
                         break
@@ -326,7 +328,7 @@ def download_asset(module: AnsibleModule, file_name: str, url: str, move_rules: 
                 move_rule.get("group"),
             )
 
-        if len(move_rules) != len(paths_to_move):
+        if len(move_rules) != len(regex_found):
             module.fail_json(msg='Some or all of the move rules were not found in downloaded assets.')
         return move_paths(module, paths_to_move)
 
