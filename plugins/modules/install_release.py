@@ -160,7 +160,13 @@ EXAMPLES = r"""
 
 
 def get_json_url(url: str) -> dict:
-    return json.load(urllib.request.urlopen(url))
+    req = urllib.request.Request(url)
+    if 'GITHUB_TOKEN' in os.environ:
+        token = os.environ['GITHUB_TOKEN']
+        req.add_header('Authorization', 'token ' + token)
+
+    with urllib.request.urlopen(req) as body:
+        return json.load(body)
 
 
 def files_have_same_content(path1: str, path2: str):
